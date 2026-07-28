@@ -2,11 +2,17 @@
 #
 # deploy-app.sh — app delivery only. Assumes ALL infra (VPC, EKS cluster,
 # node group, RDS/MQ/Redis/DynamoDB, and the k8s connection secrets) is
-# already provisioned by Terraform, and that this host has an admin
-# instance profile whose role is ALSO an EKS access entry on the cluster.
+# already provisioned by Terraform.
 #
-# Does: install tooling -> kubeconfig -> clone -> build -> push to ECR ->
-#       deploy manifests -> (optional) Bedrock log analyzer.
+# EKS access: instead of requiring the host's instance-profile role to be
+# pre-registered as an EKS access entry, this script now RESOLVES the role
+# attached to the instance it runs on and registers it on the cluster
+# itself (create-access-entry + associate-access-policy), idempotently.
+# Set MANAGE_EKS_ACCESS=false to disable and go back to expecting a
+# pre-existing entry.
+#
+# Does: install tooling -> kubeconfig -> ensure EKS access -> clone -> build
+#       -> push to ECR -> deploy manifests -> (optional) Bedrock log analyzer.
 #
 set -euo pipefail
 
@@ -24,6 +30,13 @@ export REPO_DIR="${REPO_DIR:-/opt/app/retail-store-shop-demo}"
 # ECR repo prefix — MUST match what your k8s manifests expect. The upstream
 # app uses "retail-store/<svc>". Override if your manifests differ.
 export ECR_PREFIX="${ECR_PREFIX:-retail-store}"
+
+# ---- EKS self-access config ----
+# When true, resolve this instance's IAM role and register it on the cluster.
+export MANAGE_EKS_ACCESS="${MANAGE_EKS_ACCESS:-true}"
+# Cluster-admin by default; narrow to AmazonEKSAdminViewPolicy or a
+# namespace-scoped policy if this host doesn't need full admin.
+export EKS_ACCESS_POLICY_ARN="${EKS_ACCESS_POLICY_ARN:-arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy}"
 
 export ENABLE_LOG_ANALYZER="${ENABLE_LOG_ANALYZER:-true}"
 export ANALYZER_REPO_URL="${ANALYZER_REPO_URL:-https://github.com/Raj-pro/eks_log_analyzer_through_bedrock.git}"
@@ -78,22 +91,117 @@ install_prereqs() {
 }
 
 # =====================================================================
-# 2. Kubeconfig + verify EKS access (IAM admin != EKS admin).
+# 1b. Resolve the IAM role ARN attached to THIS instance.
+#     Prefer IMDS (works even with role paths, via iam get-role);
+#     fall back to parsing the STS assumed-role ARN.
+# =====================================================================
+resolve_instance_role_arn() {
+  local token role_name caller imds=()
+
+  # IMDSv2 token (falls back gracefully to IMDSv1 if disabled).
+  token="$(curl -sX PUT "http://169.254.169.254/latest/api/token" \
+    -H "X-aws-ec2-metadata-token-ttl-seconds: 300" 2>/dev/null || true)"
+  imds=(-s --max-time 2)
+  [[ -n "$token" ]] && imds+=(-H "X-aws-ec2-metadata-token: $token")
+
+  # The security-credentials listing is the role name behind the instance profile.
+  role_name="$(curl "${imds[@]}" \
+    "http://169.254.169.254/latest/meta-data/iam/security-credentials/" 2>/dev/null \
+    | head -n1 || true)"
+
+  if [[ -n "$role_name" ]]; then
+    # get-role gives the canonical ARN (correct even if the role has a path).
+    aws iam get-role --role-name "$role_name" --query 'Role.Arn' --output text 2>/dev/null && return 0
+  fi
+
+  # Fallback: derive the role name from the assumed-role session ARN.
+  caller="$(aws sts get-caller-identity --query Arn --output text 2>/dev/null || true)"
+  if [[ "$caller" == *":assumed-role/"* ]]; then
+    role_name="$(printf '%s\n' "$caller" | sed -E 's#.*:assumed-role/([^/]+)/.*#\1#')"
+    [[ -n "$role_name" ]] && aws iam get-role --role-name "$role_name" \
+      --query 'Role.Arn' --output text 2>/dev/null && return 0
+  fi
+
+  return 1
+}
+
+# =====================================================================
+# 1c. Register this instance's role as an EKS access entry + attach the
+#     access policy. Idempotent: safe to re-run.
+# =====================================================================
+ensure_cluster_access() {
+  [[ "$MANAGE_EKS_ACCESS" == "true" ]] || { sub "MANAGE_EKS_ACCESS=false; skipping self-registration"; return 0; }
+  log "Ensuring this instance's role has EKS access on $CLUSTER_NAME"
+
+  local role_arn auth_mode
+  role_arn="$(resolve_instance_role_arn || true)"
+  [[ -n "$role_arn" && "$role_arn" != "None" ]] \
+    || die "could not resolve this instance's IAM role ARN (is an instance profile attached?)"
+  sub "instance role: $role_arn"
+
+  # Access entries require the cluster to allow the API auth path.
+  auth_mode="$(aws eks describe-cluster --name "$CLUSTER_NAME" --region "$AWS_REGION" \
+    --query 'cluster.accessConfig.authenticationMode' --output text 2>/dev/null || echo UNKNOWN)"
+  sub "cluster auth mode: $auth_mode"
+  case "$auth_mode" in
+    API|API_AND_CONFIG_MAP) : ;;
+    *)
+      die "cluster auth mode is '$auth_mode'; access entries need API or API_AND_CONFIG_MAP.
+  Flip it once (Terraform access_config.authentication_mode, or):
+    aws eks update-cluster-config --name $CLUSTER_NAME --region $AWS_REGION \\
+      --access-config authenticationMode=API_AND_CONFIG_MAP" ;;
+  esac
+
+  # Create the access entry (idempotent: tolerate 'already exists').
+  if aws eks create-access-entry --cluster-name "$CLUSTER_NAME" --region "$AWS_REGION" \
+       --principal-arn "$role_arn" >/dev/null 2>&1; then
+    sub "created access entry"
+  elif aws eks describe-access-entry --cluster-name "$CLUSTER_NAME" --region "$AWS_REGION" \
+       --principal-arn "$role_arn" >/dev/null 2>&1; then
+    sub "access entry already present"
+  else
+    die "failed to create EKS access entry for $role_arn
+  (does the caller have eks:CreateAccessEntry / eks:DescribeAccessEntry?)"
+  fi
+
+  # Associate the access policy (idempotent: re-associating just updates scope).
+  if aws eks associate-access-policy --cluster-name "$CLUSTER_NAME" --region "$AWS_REGION" \
+       --principal-arn "$role_arn" \
+       --policy-arn "$EKS_ACCESS_POLICY_ARN" \
+       --access-scope type=cluster >/dev/null 2>&1; then
+    sub "associated policy: ${EKS_ACCESS_POLICY_ARN##*/}"
+  else
+    warn "policy association returned non-zero (may already be attached); continuing"
+  fi
+}
+
+# =====================================================================
+# 2. Kubeconfig + ensure/verify EKS access (IAM admin != EKS admin).
 # =====================================================================
 setup_context() {
   log "Configuring kubectl for $CLUSTER_NAME"
   aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION"
 
-  if ! kubectl get nodes >/dev/null 2>&1; then
-    die "kubectl is Unauthorized against the cluster.
-  This host's instance-profile role is not an EKS access entry.
-  Add it in Terraform, e.g.:
-    aws_eks_access_entry            { principal_arn = <this role ARN> }
-    aws_eks_access_policy_association { policy_arn = .../AmazonEKSClusterAdminPolicy }
-  (or add the role to the aws-auth ConfigMap), then re-run."
-  fi
-  sub "cluster reachable:"
-  kubectl get nodes
+  ensure_cluster_access
+
+  # Access entries take a few seconds to propagate; retry before giving up.
+  local i
+  for i in 1 2 3 4 5 6; do
+    if kubectl get nodes >/dev/null 2>&1; then
+      sub "cluster reachable:"
+      kubectl get nodes
+      return 0
+    fi
+    sub "waiting for EKS access to propagate ($i/6)"
+    sleep 5
+  done
+
+  die "kubectl still Unauthorized after registering an access entry.
+  Check that:
+    - the resolved role ARN is the one kubectl actually presents
+      (aws sts get-caller-identity),
+    - the caller had eks:CreateAccessEntry / eks:AssociateAccessPolicy,
+    - MANAGE_EKS_ACCESS is not set to false unintentionally."
 }
 
 # =====================================================================
@@ -180,10 +288,6 @@ deploy_app() {
   log "Deployed. Watch: kubectl get pods -n $APP_NAMESPACE -w"
 }
 
-# =====================================================================
-# 5. Bedrock EKS log analyzer (optional). Admin instance profile already
-#    covers bedrock:InvokeModel + logs, so no IAM changes here.
-# =====================================================================
 # =====================================================================
 # 5. Bedrock EKS log analyzer (optional). Generated locally — not cloned.
 #    Admin instance profile already covers bedrock:InvokeModel + logs.
