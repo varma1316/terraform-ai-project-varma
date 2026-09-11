@@ -6,3 +6,15 @@ manually once adding the contents of backend.hcl file to the secrets, that is bu
 export GITHUB_TOKEN=**********
 
 working as of now
+
+
+
+
+
+
+
+
+
+
+
+
